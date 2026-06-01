@@ -1,0 +1,13 @@
+{
+  "tasks": [
+    {
+      "id": "b7f18b78",
+      "cron": "37 3 * * 0",
+      "prompt": "清理 Claude Code 遥测积压文件。执行：rm -f \"C:/Users/24280/.claude/telemetry/\"*.json 2>/dev/null; echo \"遥测清理完成\"",
+      "createdAt": 1780295531922,
+      "recurring": true,
+      "createdBySessionId": "d261c8be-7751-422b-aa25-d826555ba98e",
+      "createdByPid": 3116
+    }
+  ]
+}
