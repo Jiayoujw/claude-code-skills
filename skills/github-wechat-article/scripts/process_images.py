@@ -1,308 +1,263 @@
 #!/usr/bin/env python3
 """
-GitHub 项目图片处理工具
-用于 github-wechat-article skill 的图片预处理：
-  下载 → 裁剪封面 → 压缩 GIF → Base64 编码
+process_images.py - GitHub 项目图片处理脚本
+用于 github-wechat-article skill
 
-用法:
-  python process_images.py download --repo owner/repo --out-dir ./images/
-  python process_images.py crop-cover --input cover.png --output cover-cropped.png
-  python process_images.py compress-gif --input demo.gif --output demo_compressed.gif
-  python process_images.py base64-encode --input image.png
-  python process_images.py process-all --repo owner/repo --out-dir ./images/ --html template.html
+功能：
+1. 从 GitHub README 提取图片链接并下载
+2. 裁剪 GitHub OpenGraph 图为微信公众号封面尺寸 (900x383)
+3. 压缩 GIF（隔帧取样 + 缩放 + 调色板降色）
+4. 将图片 Base64 编码，生成 <img> 标签供 HTML 嵌入
+
+用法：
+  python process_images.py --project-url https://github.com/owner/repo --output-dir xxx-images
 """
 
 import argparse
 import base64
+import io
 import os
+import re
 import sys
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 try:
     from PIL import Image
-    HAS_PILLOW = True
 except ImportError:
-    HAS_PILLOW = False
-    print("⚠ Pillow 未安装，请运行: pip install Pillow", file=sys.stderr)
+    print("错误：需要安装 Pillow。运行：pip install Pillow")
+    sys.exit(1)
 
 
-COVER_WIDTH = 900
-COVER_HEIGHT = 383
-GIF_MAX_SIZE_MB = 5
+def download_image(url: str, timeout: int = 15) -> bytes:
+    """下载图片并返回二进制数据"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
 
-# ─── 下载 ───────────────────────────────────────────────
-
-def download_images(image_urls: list[str], out_dir: str) -> list[str]:
-    """下载图片到指定目录，返回本地文件路径列表"""
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    local_paths = []
-    for i, url in enumerate(image_urls):
-        try:
-            ext = url.rsplit(".", 1)[-1].split("?")[0] or "png"
-            if ext not in ("png", "jpg", "jpeg", "gif", "webp"):
-                ext = "png"
-            fname = f"image_{i:02d}.{ext}"
-            fpath = out_path / fname
-
-            if not fpath.exists():
-                print(f"⬇ 下载: {url}")
-                urllib.request.urlretrieve(url, str(fpath))
-            else:
-                print(f"✓ 已存在: {fname}")
-            local_paths.append(str(fpath))
-        except Exception as e:
-            print(f"✗ 下载失败 {url}: {e}", file=sys.stderr)
-    return local_paths
+def save_image(data: bytes, path: Path) -> None:
+    """保存二进制数据为文件"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
 
 
-# ─── 封面裁剪 ───────────────────────────────────────────
+def get_opengraph_image(owner: str, repo: str) -> str:
+    """获取 GitHub OpenGraph 图片 URL"""
+    return f"https://opengraph.githubassets.com/1/{owner}/{repo}"
 
-def crop_cover(input_path: str, output_path: str = None,
-               width: int = COVER_WIDTH, height: int = COVER_HEIGHT):
-    """将图片裁剪为微信公众号封面尺寸 900×383（2.35:1）"""
-    if not HAS_PILLOW:
-        print("✗ 需要 Pillow 库", file=sys.stderr)
-        return None
 
-    img = Image.open(input_path)
-    tw, th = width, height
+def extract_readme_images(readme_html: str) -> list[str]:
+    """从 README HTML 中提取图片 URL"""
+    # 匹配 <img src="..."> 和 ![alt](url)
+    img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', readme_html)
+    md_urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', readme_html)
+    return list(set(img_urls + md_urls))
 
-    # 计算裁剪区域（中心裁剪到目标比例）
-    target_ratio = tw / th
-    iw, ih = img.size
-    current_ratio = iw / ih
 
-    if current_ratio > target_ratio:
-        # 图片太宽，裁左右
-        new_w = int(ih * target_ratio)
-        new_h = ih
-        left = (iw - new_w) // 2
-        top = 0
+def crop_cover(image_data: bytes, output_path: Path) -> None:
+    """裁剪图片为微信公众号封面尺寸 900x383 (2.35:1)"""
+    img = Image.open(io.BytesIO(image_data))
+    img = img.convert("RGB")
+    
+    target_w, target_h = 900, 383
+    src_w, src_h = img.size
+    
+    # 计算裁剪区域（居中裁剪）
+    src_ratio = src_w / src_h
+    target_ratio = target_w / target_h
+    
+    if src_ratio > target_ratio:
+        # 原图更宽，按高度裁剪
+        new_w = int(src_h * target_ratio)
+        left = (src_w - new_w) // 2
+        crop_box = (left, 0, left + new_w, src_h)
     else:
-        # 图片太高，裁上下
-        new_w = iw
-        new_h = int(iw / target_ratio)
-        left = 0
-        top = (ih - new_h) // 2
-
-    cropped = img.crop((left, top, left + new_w, top + new_h))
-    cropped = cropped.resize((tw, th), Image.LANCZOS)
-
-    if output_path is None:
-        stem = Path(input_path).stem
-        output_path = str(Path(input_path).parent / f"{stem}-cover-{tw}x{th}.png")
-
-    cropped.save(output_path, "PNG", optimize=True)
-    print(f"✓ 封面已裁剪: {output_path} ({tw}×{th})")
-    return output_path
+        # 原图更高，按宽度裁剪
+        new_h = int(src_w / target_ratio)
+        top = (src_h - new_h) // 2
+        crop_box = (0, top, src_w, top + new_h)
+    
+    img_cropped = img.crop(crop_box)
+    img_resized = img_cropped.resize((target_w, target_h), Image.LANCZOS)
+    img_resized.save(output_path, "PNG", optimize=True)
+    print(f"封面图已保存：{output_path}")
 
 
-# ─── GIF 压缩 ───────────────────────────────────────────
-
-def compress_gif(input_path: str, output_path: str = None,
-                 max_size_mb: float = GIF_MAX_SIZE_MB,
-                 frame_skip: int = 2, scale: float = 0.7,
-                 colors: int = 192):
+def compress_gif(input_data: bytes, output_path: Path, 
+                 max_colors: int = 192, max_size_mb: int = 5) -> None:
     """
-    压缩 GIF 以适应微信公众号限制（<5MB）。
-    - frame_skip: 每隔 N 帧取一帧（2 = 隔帧取样）
-    - scale: 缩放比例
-    - colors: 调色板颜色数
+    压缩 GIF：隔帧取样 + 缩放 + 调色板降色
+    注意：使用 disposal=0 + optimize=False 避免透明通道 bug
     """
-    if not HAS_PILLOW:
-        print("✗ 需要 Pillow 库", file=sys.stderr)
-        return None
-
-    if output_path is None:
-        stem = Path(input_path).stem
-        output_path = str(Path(input_path).parent / f"{stem}_compressed.gif")
-
-    im = Image.open(input_path)
-
-    # 收集缩放后的帧
-    frames = []
-    duration = im.info.get("duration", 100)
-    frame_idx = 0
-
+    input_path = output_path.with_suffix(".tmp.gif")
+    with open(input_path, "wb") as f:
+        f.write(input_data)
+    
     try:
-        while True:
-            if frame_idx % frame_skip == 0:
-                # 缩放
-                new_w = int(im.width * scale)
-                new_h = int(im.height * scale)
-                resized = im.resize((new_w, new_h), Image.LANCZOS)
+        img = Image.open(input_path)
+        
+        # 隔帧取样
+        frames = []
+        try:
+            while True:
+                frames.append(img.copy())
+                img.seek(img.tell() + 2)  # 每隔一帧取一帧
+        except EOFError:
+            pass
+        
+        if not frames:
+            print(f"警告：GIF 无有效帧，跳过压缩：{output_path.name}")
+            return
+        
+        # 缩放（如果原图太大）
+        max_dim = 800
+        first_frame = frames[0]
+        if first_frame.width > max_dim or first_frame.height > max_dim:
+            ratio = min(max_dim / first_frame.width, max_dim / first_frame.height)
+            new_size = (int(first_frame.width * ratio), int(first_frame.height * ratio))
+            frames = [f.resize(new_size, Image.LANCZOS) for f in frames]
+        
+        # 调色板降色（先转 RGB，再 quantize）
+        rgb_frames = [f.convert("RGB") for f in frames]
+        quantized = [f.quantize(colors=max_colors) for f in rgb_frames]
+        
+        # 保存（先输出到新路径，避免源文件损坏）
+        output_path_tmp = output_path.with_suffix(".compressed.gif")
+        quantized[0].save(
+            output_path_tmp,
+            save_all=True,
+            append_images=quantized[1:],
+            loop=0,
+            disposal=0,
+            optimize=False
+        )
+        
+        # 检查文件大小
+        size_mb = output_path_tmp.stat().st_size / (1024 * 1024)
+        if size_mb > max_size_mb:
+            print(f"警告：压缩后文件仍大于 {max_size_mb}MB ({size_mb:.1f}MB)：{output_path.name}")
+        
+        # 替换原文件
+        if output_path.exists():
+            output_path.unlink()
+        output_path_tmp.rename(output_path)
+        print(f"GIF 压缩完成：{output_path.name} ({size_mb:.1f}MB)")
+        
+    finally:
+        if input_path.exists():
+            input_path.unlink()
 
-                # 安全转换到调色板模式
-                f_rgb = resized.convert("RGB")
-                f_p = f_rgb.quantize(colors=colors)
-                frames.append(f_p)
-            frame_idx += 1
-            im.seek(im.tell() + 1)
-    except EOFError:
-        pass
 
-    if not frames:
-        print("✗ GIF 中没有有效帧", file=sys.stderr)
-        return None
-
-    # 保存（使用 disposal=0 避免透明通道 bug，optimize=False 避免损坏）
-    frames[0].save(
-        output_path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration * frame_skip,
-        loop=0,
-        disposal=0,
-        optimize=False,
-    )
-
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"✓ GIF 已压缩: {output_path} "
-          f"（{len(frames)} 帧, {size_mb:.1f}MB）")
-
-    if size_mb > max_size_mb:
-        print(f"⚠ 仍然超过 {max_size_mb}MB，建议进一步降低 scale/colors")
-
-    return output_path
-
-
-# ─── Base64 编码 ────────────────────────────────────────
-
-def base64_encode_image(image_path: str) -> str:
-    """将图片编码为 Base64 Data URI 字符串"""
-    ext = Path(image_path).suffix.lower().lstrip(".")
-    mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "gif": "image/gif", "webp": "image/webp"}
-    mime = mime_map.get(ext, "image/png")
-
+def image_to_base64(image_path: Path) -> str:
+    """将图片文件转换为 Base64 Data URI"""
+    suffix = image_path.suffix.lower()
+    mime_map = {".png": "image/png", ".jpg": "image/jpeg", 
+                 ".jpeg": "image/jpeg", ".gif": "image/gif",
+                 ".webp": "image/webp"}
+    mime = mime_map.get(suffix, "image/png")
+    
     with open(image_path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("ascii")
-
-    return f"data:{mime};base64,{data}"
-
-
-def generate_img_tag(image_path: str, alt: str = "") -> str:
-    """生成内嵌 Base64 的 HTML img 标签"""
-    uri = base64_encode_image(image_path)
-    if alt:
-        return (f'<p style="text-align:center;margin:18px 0;">\n'
-                f'  <img src="{uri}" alt="{alt}" '
-                f'style="max-width:100%;display:block;margin:0 auto;">\n'
-                f'  <span style="font-size:12px;color:#999;display:block;'
-                f'margin-top:4px;">▲ {alt}</span>\n</p>')
-    return (f'<p style="text-align:center;margin:18px 0;">\n'
-            f'  <img src="{uri}" alt="" '
-            f'style="max-width:100%;display:block;margin:0 auto;">\n</p>')
+        data = f.read()
+    
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
 
-# ─── 全流程 ────────────────────────────────────────────
+def generate_img_tag(base64_uri: str, alt: str = "", caption: str = "") -> str:
+    """生成微信兼容的 <img> 标签"""
+    tag = f'<p style="text-align:center;margin:18px 0;"><img src="{base64_uri}" alt="{alt}" style="max-width:100%;display:block;margin:0 auto;" loading="lazy"></p>'
+    if caption:
+        tag += f'<span style="font-size:12px;color:#999;display:block;margin-top:4px;">▲ {caption}</span>'
+    return tag
 
-def process_all(repo_owner: str, repo_name: str,
-                out_dir: str, html_path: str = None):
-    """一键处理：下载 → 裁剪 → 压缩 → 编码 → 替换 HTML"""
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    # 1. 封面图
-    og_url = (f"https://opengraph.githubassets.com/1/"
-              f"{repo_owner}/{repo_name}")
-    print(f"📷 获取 OpenGraph 封面: {og_url}")
-    cover_path = out / "cover-github-banner.png"
-    try:
-        urllib.request.urlretrieve(og_url, str(cover_path))
-        crop_cover(str(cover_path))
-    except Exception as e:
-        print(f"⚠ OpenGraph 封面获取失败: {e}")
-
-    # 2. 处理 HTML 中的图片（如果有 HTML 模板）
-    if html_path:
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
-
-        # 收集本地图片并替换为 Base64
-        import re
-        for img_match in re.finditer(
-            r'<img\s+src="(?!data:)([^"]+\.(?:png|jpg|jpeg|gif|webp))"',
-            html, re.IGNORECASE
-        ):
-            img_file = img_match.group(1)
-            img_path = out / img_file
-            if img_path.exists():
-                uri = base64_encode_image(str(img_path))
-                html = html.replace(img_file, uri)
-                print(f"✓ 内嵌: {img_file}")
-
-        output_html = str(Path(html_path).parent / f"{repo_name}-wechat-article.html")
-        with open(output_html, "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f"✓ HTML 已生成: {output_html}")
-
-
-# ─── CLI ────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="GitHub 项目图片处理工具（github-wechat-article skill）")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    # download
-    p_dl = sub.add_parser("download", help="下载图片")
-    p_dl.add_argument("--urls", nargs="+", required=True, help="图片 URL 列表")
-    p_dl.add_argument("--out-dir", default="./images", help="输出目录")
-
-    # crop-cover
-    p_cc = sub.add_parser("crop-cover", help="裁剪封面为 900×383")
-    p_cc.add_argument("--input", required=True, help="输入图片路径")
-    p_cc.add_argument("--output", default=None, help="输出路径（可选）")
-    p_cc.add_argument("--width", type=int, default=900)
-    p_cc.add_argument("--height", type=int, default=383)
-
-    # compress-gif
-    p_cg = sub.add_parser("compress-gif", help="压缩 GIF")
-    p_cg.add_argument("--input", required=True, help="输入 GIF 路径")
-    p_cg.add_argument("--output", default=None, help="输出路径（可选）")
-    p_cg.add_argument("--max-size-mb", type=float, default=5.0)
-    p_cg.add_argument("--frame-skip", type=int, default=2)
-    p_cg.add_argument("--scale", type=float, default=0.7)
-    p_cg.add_argument("--colors", type=int, default=192)
-
-    # base64-encode
-    p_be = sub.add_parser("base64-encode", help="Base64 编码单张图片")
-    p_be.add_argument("--input", required=True, help="输入图片路径")
-
-    # process-all
-    p_pa = sub.add_parser("process-all", help="一键全流程处理")
-    p_pa.add_argument("--repo", required=True, help="owner/repo")
-    p_pa.add_argument("--out-dir", required=True, help="输出目录")
-    p_pa.add_argument("--html", default=None, help="HTML 模板路径（可选）")
-
+    parser = argparse.ArgumentParser(description="GitHub 项目图片处理脚本")
+    parser.add_argument("--project-url", required=True, help="GitHub 项目 URL")
+    parser.add_argument("--output-dir", required=True, help="图片输出目录")
+    parser.add_argument("--no-cover", action="store_true", help="跳过封面图生成")
     args = parser.parse_args()
-
-    if args.command == "download":
-        download_images(args.urls, args.out_dir)
-
-    elif args.command == "crop-cover":
-        crop_cover(args.input, args.output, args.width, args.height)
-
-    elif args.command == "compress-gif":
-        compress_gif(args.input, args.output,
-                     args.max_size_mb, args.frame_skip,
-                     args.scale, args.colors)
-
-    elif args.command == "base64-encode":
-        uri = base64_encode_image(args.input)
-        print(uri)
-
-    elif args.command == "process-all":
-        parts = args.repo.split("/")
-        if len(parts) != 2:
-            print("✗ --repo 格式应为 owner/repo", file=sys.stderr)
-            sys.exit(1)
-        process_all(parts[0], parts[1], args.out_dir, args.html)
+    
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 解析项目 URL
+    url = args.project_url.rstrip("/")
+    match = re.match(r"https?://github.com/([^/]+)/([^/]+)", url)
+    if not match:
+        print(f"错误：无法解析 GitHub URL：{url}")
+        sys.exit(1)
+    
+    owner, repo = match.group(1), match.group(2)
+    print(f"处理项目：{owner}/{repo}")
+    
+    # 1. 下载 GitHub OpenGraph 封面图
+    if not args.no_cover:
+        try:
+            og_url = get_opengraph_image(owner, repo)
+            print(f"下载封面图：{og_url}")
+            og_data = download_image(og_url)
+            cover_path = output_dir / "cover-github-banner.png"
+            crop_cover(og_data, cover_path)
+        except Exception as e:
+            print(f"警告：封面图下载失败：{e}")
+    
+    # 2. 获取 README 图片
+    try:
+        readme_url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/README.md"
+        readme_data = download_image(readme_url)
+        readme_text = readme_data.decode("utf-8", errors="ignore")
+        img_urls = extract_readme_images(readme_text)
+        print(f"从 README 中发现 {len(img_urls)} 张图片")
+        
+        for i, img_url in enumerate(img_urls[:10]):  # 最多下载 10 张
+            try:
+                if not img_url.startswith("http"):
+                    # 相对路径，拼接 base URL
+                    if img_url.startswith("/"):
+                        img_url = f"https://github.com{img_url}"
+                    else:
+                        img_url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{img_url}"
+                
+                print(f"下载图片 {i+1}/{len(img_urls)}：{img_url[:80]}...")
+                img_data = download_image(img_url)
+                
+                # 判断格式并保存
+                ext = ".png"
+                if img_url.lower().endswith(".gif"):
+                    ext = ".gif"
+                elif img_url.lower().endswith((".jpg", ".jpeg")):
+                    ext = ".jpg"
+                
+                img_path = output_dir / f"screenshot-{i+1}{ext}"
+                
+                if ext == ".gif":
+                    # 先保存原文件，再压缩
+                    tmp_path = img_path.with_suffix(".orig.gif")
+                    save_image(img_data, tmp_path)
+                    compress_gif(tmp_path.read_bytes(), img_path)
+                    tmp_path.unlink(missing_ok=True)
+                else:
+                    save_image(img_data, img_path)
+                
+                # 生成 Base64 版本
+                b64 = image_to_base64(img_path)
+                tag = generate_img_tag(b64, alt=f"截图 {i+1}")
+                print(f"  Base64 URI 长度：{len(b64)} 字符")
+                print(f"  HTML 标签：{tag[:100]}...")
+                
+            except Exception as e:
+                print(f"  警告：下载失败：{e}")
+                continue
+                
+    except Exception as e:
+        print(f"警告：README 处理失败：{e}")
+    
+    print(f"\n处理完成！图片保存在：{output_dir}")
 
 
 if __name__ == "__main__":
